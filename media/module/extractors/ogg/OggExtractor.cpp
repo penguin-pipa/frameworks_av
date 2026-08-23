@@ -136,6 +136,11 @@ protected:
     AMediaFormat *mMeta;
     AMediaFormat *mFileMeta;
 
+    // Ogg may contain multiple logical streams, such as audio and cover art.
+    // This extractor follows only the stream containing the codec headers.
+    uint32_t mSerialNo;
+    bool mSerialNoSet;
+
     Vector<TOCEntry> mTableOfContents;
 
     int32_t mHapticChannelCount;
@@ -324,6 +329,8 @@ MyOggExtractor::MyOggExtractor(
       mNumHeaders(numHeaders),
       mSeekPreRollUs(seekPreRollUs),
       mFirstDataOffset(-1),
+      mSerialNo(0),
+      mSerialNoSet(false),
       mHapticChannelCount(0) {
     mCurrentPage.mNumSegments = 0;
     mCurrentPage.mFlags = 0;
@@ -446,7 +453,7 @@ status_t MyOggExtractor::findPrevGranulePosition(
                 // no signature start in the rest of this buffer.
                 break;
             }
-            i = (p-&signatureBuffer[0]);
+            i = (p - &signatureBuffer[0]);
             // loop start chosen to ensure we will always have lenOggS bytes
             if (memcmp("OggS", &signatureBuffer[i], lenOggS) == 0) {
                 prevPageOffset = nextOffset + i;
@@ -478,9 +485,16 @@ status_t MyOggExtractor::findPrevGranulePosition(
         if (n <= 0) {
             return (flag & 0x4) ? OK : (status_t)n;
         }
-        flag = prevPage.mFlags;
+        if (mSerialNoSet && prevPage.mSerialNo != mSerialNo) {
+            // The preceding physical page belongs to another logical stream.
+            // Continue searching before it for the preceding audio page.
+            return findPrevGranulePosition(prevPageOffset, granulePos);
+        }
+        if (!mSerialNoSet || prevPage.mSerialNo == mSerialNo) {
+            flag = prevPage.mFlags;
+            *granulePos = prevPage.mGranulePosition;
+        }
         prevPageOffset += n;
-        *granulePos = prevPage.mGranulePosition;
         if (prevPageOffset == pageOffset) {
             return OK;
         }
@@ -543,10 +557,30 @@ status_t MyOggExtractor::seekToOffset(off64_t offset) {
     }
 
     off64_t pageOffset;
-    status_t err = findNextPage(offset, &pageOffset);
+    Page page;
+    status_t err;
+    for (;;) {
+        err = findNextPage(offset, &pageOffset);
+        if (err != OK) {
+            return err;
+        }
 
-    if (err != OK) {
-        return err;
+        ssize_t pageSize = readPage(pageOffset, &page);
+        if (pageSize <= 0) {
+            return (status_t)pageSize;
+        }
+
+        if (!mSerialNoSet) {
+            mSerialNo = page.mSerialNo;
+            mSerialNoSet = true;
+        }
+
+        if (page.mSerialNo == mSerialNo) {
+            break;
+        }
+
+        // Skip pages belonging to another logical stream.
+        offset = pageOffset + pageSize;
     }
 
     // We found the page we wanted to seek to, but we'll also need
@@ -926,7 +960,13 @@ media_status_t MyOggExtractor::_readNextPacket(MediaBufferHelper **out, bool cal
 
         mOffset += mCurrentPageSize;
         uint8_t flag = mCurrentPage.mFlags;
-        ssize_t n = readPage(mOffset, &mCurrentPage);
+        ssize_t n;
+        do {
+            n = readPage(mOffset, &mCurrentPage);
+            if (n > 0 && mCurrentPage.mSerialNo != mSerialNo) {
+                mOffset += n;
+            }
+        } while (n > 0 && mCurrentPage.mSerialNo != mSerialNo);
 
         if (n <= 0) {
             if (buffer) {
@@ -1027,6 +1067,11 @@ void MyOggExtractor::buildTableOfContents() {
     Page page;
     ssize_t pageSize;
     while ((pageSize = readPage(offset, &page)) > 0) {
+        if (page.mSerialNo != mSerialNo) {
+            offset += (size_t)pageSize;
+            continue;
+        }
+
         mTableOfContents.push();
 
         TOCEntry &entry =
