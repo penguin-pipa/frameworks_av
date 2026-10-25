@@ -18,6 +18,7 @@
 #define LOG_TAG "MetaDataUtilsTest"
 #include <utils/Log.h>
 
+#include <cstring>
 #include <fstream>
 #include <memory>
 #include <string>
@@ -437,6 +438,33 @@ TEST_P(VorbisTest, VorbisCommentTest) {
             ASSERT_TRUE(status) << "Failed to get the tag value";
             ASSERT_STREQ(value.c_str(), tagValue);
         }
+        AMediaFormat_delete(fileMeta);
+    }
+}
+
+TEST(MetaDataUtilsTest, ParseVorbisCommentAliases) {
+    struct VorbisTag {
+        const char *comment;
+        const char *key;
+        const char *expected;
+    };
+    const VorbisTag tags[] = {
+            {"album_artist=FictionJunction YUUKA", AMEDIAFORMAT_KEY_ALBUMARTIST,
+                    "FictionJunction YUUKA"},
+            {"track=12", AMEDIAFORMAT_KEY_CDTRACKNUMBER, "12"},
+            {"disc=1", AMEDIAFORMAT_KEY_DISCNUMBER, "1"},
+    };
+
+    for (const auto &tag : tags) {
+        AMediaFormat *fileMeta = AMediaFormat_new();
+        ASSERT_NE(fileMeta, nullptr);
+
+        parseVorbisComment(fileMeta, tag.comment, strlen(tag.comment));
+
+        const char *value = nullptr;
+        ASSERT_TRUE(AMediaFormat_getString(fileMeta, tag.key, &value));
+        EXPECT_STREQ(tag.expected, value);
+
         AMediaFormat_delete(fileMeta);
     }
 }
